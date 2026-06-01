@@ -2,6 +2,14 @@
 
 Proof-of-concept kite alert tool for the Rimouski area.
 
+## Setup
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
 ## What it does
 
 - Pulls live wind from Tempest
