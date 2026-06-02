@@ -576,8 +576,10 @@ def discipline_score(
             wind_s = 1.0
             reasons.append(f"vent {hour.wind_kt:.1f} kt dans la plage foil")
         else:
-            d = min(abs(hour.wind_kt - FOIL_MIN), abs(hour.wind_kt - FOIL_MAX))
-            wind_s = max(0.0, 1.0 - d / 8.0)
+            if hour.wind_kt < FOIL_MIN:
+                wind_s = max(0.0, 1.0 - (FOIL_MIN - hour.wind_kt) / 3.0)
+            else:
+                wind_s = max(0.0, 1.0 - (hour.wind_kt - FOIL_MAX) / 6.0)
             reasons.append(f"vent {hour.wind_kt:.1f} kt hors plage foil")
 
         delta_h = nearest_high_tide_delta_h(hour.ts, tides)
@@ -596,8 +598,10 @@ def discipline_score(
             wind_s = 1.0
             reasons.append(f"vent {hour.wind_kt:.1f} kt dans la plage twin-tip")
         else:
-            d = min(abs(hour.wind_kt - TT_MIN), abs(hour.wind_kt - TT_MAX))
-            wind_s = max(0.0, 1.0 - d / 10.0)
+            if hour.wind_kt < TT_MIN:
+                wind_s = max(0.0, 1.0 - (TT_MIN - hour.wind_kt) / 4.0)
+            else:
+                wind_s = max(0.0, 1.0 - (hour.wind_kt - TT_MAX) / 10.0)
             reasons.append(f"vent {hour.wind_kt:.1f} kt hors plage twin-tip")
         tide_s = 0.6
 
@@ -653,6 +657,7 @@ def choose_best_windows_horizon(
     sun_by_day: dict[str, SunWindow],
     horizon_hours: int,
     top_n: int,
+    min_separation_hours: int = 6,
 ) -> list[dict[str, Any]]:
     now = datetime.now(tz=TZ).replace(minute=0, second=0, microsecond=0)
     end = now + timedelta(hours=horizon_hours)
@@ -675,6 +680,8 @@ def choose_best_windows_horizon(
     for cand in out:
         hour_key = cand["ts"]
         if hour_key in used_hours:
+            continue
+        if any(abs((hour_key - row["ts"]).total_seconds()) < min_separation_hours * 3600 for row in selected):
             continue
         selected.append(cand)
         used_hours.add(hour_key)
@@ -817,6 +824,7 @@ def post_discord(webhook_url: str, content: str) -> None:
 
 def build_discord_alert_markdown(
     top: list[dict[str, Any]],
+    horizon_hours: int,
     tides: list[TideEvent],
     marine_by_hour: dict[str, MarinePoint],
     sun_by_day: dict[str, SunWindow],
@@ -855,12 +863,13 @@ def build_discord_alert_markdown(
         lines.append(surf_only_hint)
 
     lines.append("")
-    lines.append("### Top opportunités (24h)")
+    horizon_label = f"{horizon_hours // 24} jours" if horizon_hours % 24 == 0 else f"{horizon_hours}h"
+    lines.append(f"### Top opportunités ({horizon_label})")
     lines.append("")
     lines.append("")
     if not top:
         lines.append("- Aucun créneau solide détecté")
-    for row in top[:3]:
+    for row in top[:5]:
         p: ForecastHour = row["pt"]
         gear = {"foil": "🪁 Foil", "twintip": "🏄 Twin-tip", "surf": "🌊 Surf"}.get(row["discipline"], row["discipline"])
         dir_txt = cardinal_16(p.wind_deg) or "?"
@@ -944,7 +953,8 @@ def main() -> int:
                 f"vers {best_wave.ts.strftime('%a %H:%M')}"
             )
         report = build_discord_alert_markdown(
-            top,
+            qualified if qualified else candidates,
+            horizon_hours,
             tides,
             marine_by_hour,
             sun_by_day,

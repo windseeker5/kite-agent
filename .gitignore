@@ -1,6 +1,7 @@
 .playwright-mcp/
 .venv/
 config/*.local.json
+logs/
 __pycache__/
 *.pyc
 .env

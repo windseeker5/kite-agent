@@ -27,7 +27,7 @@
   },
   "alert": {
     "threshold": 80,
-    "horizon_hours": 72,
+    "horizon_hours": 168,
     "discord_webhook": ""
   }
 }

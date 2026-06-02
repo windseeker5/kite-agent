@@ -30,7 +30,7 @@ python kite_poc.py --config config/rimouski.json
 python kite_poc.py --monitor
 ```
 
-Alert settings come from `config/rimouski.json`. Put secrets in an ignored local override:
+Alert settings come from `config/rimouski.json`. The default Rimouski alert horizon is 7 days. Put secrets in an ignored local override:
 
 ```json
 {
