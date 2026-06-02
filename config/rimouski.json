@@ -1,0 +1,28 @@
+{
+  "spot_name": "Rimouski",
+  "timezone": "America/Toronto",
+  "lat": 48.544,
+  "lon": -68.412,
+  "providers": {
+    "windguru_spot_id": 148269,
+    "tempest_location_id": 73230,
+    "tempest_device_id": 336839,
+    "tempest_api_key": "6bff2f89-84ab-463c-886e-fc0f443da4cf",
+    "tide_station_id": "2985",
+    "windy_waves_url": "https://www.windy.com/48.433/-68.550/ecmwfWaves/waves?waves,48.114,-68.550,8"
+  },
+  "preferences": {
+    "preferred_directions": ["SW", "NE"],
+    "foil_min": 8,
+    "foil_max": 16,
+    "twintip_min": 17,
+    "twintip_max": 35,
+    "gust_ideal_max": 6,
+    "gust_acceptable_max": 10,
+    "foil_high_tide_window_h": 2,
+    "surf_strong_wind_threshold": 25,
+    "surf_memory_h": 48,
+    "surf_trigger_dirs": ["NE", "NW"],
+    "surf_only_wave_trigger_m": 1.0
+  }
+}

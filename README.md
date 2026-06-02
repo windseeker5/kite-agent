@@ -21,11 +21,18 @@ pip install -r requirements.txt
 ## Run
 
 ```bash
-python kite_poc.py
+python kite_poc.py --config config/rimouski.json
 ```
 
 ## Alert mode
 
 ```bash
-python kite_poc.py --monitor --threshold 80 --horizon-hours 72 --discord-webhook "YOUR_WEBHOOK_URL"
+python kite_poc.py --config config/rimouski.json --monitor --threshold 80 --horizon-hours 72 --discord-webhook "YOUR_WEBHOOK_URL"
 ```
+
+## Config
+
+Spot/provider/preferences are loaded from JSON config files.
+
+- Current config: `config/rimouski.json`
+- Future spots: add new files (example `config/iles-madeleine.json`)

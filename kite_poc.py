@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import math
 import argparse
+import base64
+from pathlib import Path
 import re
 import statistics
 import sys
@@ -17,8 +19,15 @@ import requests
 
 
 TZ = ZoneInfo("America/Toronto")
+SPOT_NAME = "Rimouski"
 SPOT_LAT = 48.544
 SPOT_LON = -68.412
+WINDGURU_SPOT_ID = 148269
+TEMPEST_LOCATION_ID = 73230
+TEMPEST_DEVICE_ID = 336839
+TEMPEST_API_KEY = "6bff2f89-84ab-463c-886e-fc0f443da4cf"
+TIDE_STATION_ID = "2985"
+WINDY_WAVES_URL = "https://www.windy.com/48.433/-68.550/ecmwfWaves/waves?waves,48.114,-68.550,8"
 
 PREFERRED_DIRECTIONS = {"SW", "NE"}
 FOIL_MIN, FOIL_MAX = 8.0, 16.0
@@ -29,6 +38,48 @@ FOIL_HIGH_TIDE_WINDOW_H = 2.0
 SURF_STRONG_WIND_THRESHOLD = 25.0
 SURF_MEMORY_H = 48
 SURF_TRIGGER_DIRS = {"NE", "NW"}
+SURF_ONLY_WAVE_TRIGGER_M = 1.0
+
+
+def load_config(config_path: str) -> None:
+    global TZ, SPOT_NAME, SPOT_LAT, SPOT_LON
+    global WINDGURU_SPOT_ID, TEMPEST_LOCATION_ID, TEMPEST_DEVICE_ID, TEMPEST_API_KEY, TIDE_STATION_ID, WINDY_WAVES_URL
+    global PREFERRED_DIRECTIONS, FOIL_MIN, FOIL_MAX, TT_MIN, TT_MAX
+    global GUST_IDEAL_MAX, GUST_ACCEPTABLE_MAX, FOIL_HIGH_TIDE_WINDOW_H
+    global SURF_STRONG_WIND_THRESHOLD, SURF_MEMORY_H, SURF_TRIGGER_DIRS, SURF_ONLY_WAVE_TRIGGER_M
+
+    p = Path(config_path)
+    if not p.exists():
+        return
+    cfg = json.loads(p.read_text())
+
+    tzname = cfg.get("timezone", "America/Toronto")
+    TZ = ZoneInfo(tzname)
+    SPOT_NAME = cfg.get("spot_name", SPOT_NAME)
+    SPOT_LAT = float(cfg.get("lat", SPOT_LAT))
+    SPOT_LON = float(cfg.get("lon", SPOT_LON))
+
+    providers = cfg.get("providers", {})
+    WINDGURU_SPOT_ID = int(providers.get("windguru_spot_id", WINDGURU_SPOT_ID))
+    TEMPEST_LOCATION_ID = int(providers.get("tempest_location_id", TEMPEST_LOCATION_ID))
+    TEMPEST_DEVICE_ID = int(providers.get("tempest_device_id", TEMPEST_DEVICE_ID))
+    TEMPEST_API_KEY = str(providers.get("tempest_api_key", TEMPEST_API_KEY))
+    TIDE_STATION_ID = str(providers.get("tide_station_id", TIDE_STATION_ID))
+    WINDY_WAVES_URL = str(providers.get("windy_waves_url", WINDY_WAVES_URL))
+
+    prefs = cfg.get("preferences", {})
+    PREFERRED_DIRECTIONS = set(prefs.get("preferred_directions", list(PREFERRED_DIRECTIONS)))
+    FOIL_MIN = float(prefs.get("foil_min", FOIL_MIN))
+    FOIL_MAX = float(prefs.get("foil_max", FOIL_MAX))
+    TT_MIN = float(prefs.get("twintip_min", TT_MIN))
+    TT_MAX = float(prefs.get("twintip_max", TT_MAX))
+    GUST_IDEAL_MAX = float(prefs.get("gust_ideal_max", GUST_IDEAL_MAX))
+    GUST_ACCEPTABLE_MAX = float(prefs.get("gust_acceptable_max", GUST_ACCEPTABLE_MAX))
+    FOIL_HIGH_TIDE_WINDOW_H = float(prefs.get("foil_high_tide_window_h", FOIL_HIGH_TIDE_WINDOW_H))
+    SURF_STRONG_WIND_THRESHOLD = float(prefs.get("surf_strong_wind_threshold", SURF_STRONG_WIND_THRESHOLD))
+    SURF_MEMORY_H = int(prefs.get("surf_memory_h", SURF_MEMORY_H))
+    SURF_TRIGGER_DIRS = set(prefs.get("surf_trigger_dirs", list(SURF_TRIGGER_DIRS)))
+    SURF_ONLY_WAVE_TRIGGER_M = float(prefs.get("surf_only_wave_trigger_m", SURF_ONLY_WAVE_TRIGGER_M))
 
 
 @dataclass
@@ -45,6 +96,21 @@ class TideEvent:
     ts: datetime
     kind: str
     level_m: float
+
+
+@dataclass
+class MarinePoint:
+    ts: datetime
+    wave_m: float | None
+    swell_m: float | None
+    swell_period_s: float | None
+
+
+@dataclass
+class SunWindow:
+    day: str
+    sunrise: datetime
+    sunset: datetime
 
 
 def cardinal_16(deg: float | None) -> str | None:
@@ -116,6 +182,160 @@ def fetch_open_meteo_forecast(hours: int = 48) -> list[ForecastHour]:
     return out
 
 
+def fetch_marine_and_sun(hours: int = 72) -> tuple[dict[str, MarinePoint], dict[str, SunWindow], list[str]]:
+    notes: list[str] = []
+    now = datetime.now(tz=TZ)
+    end = now + timedelta(hours=hours)
+    url = (
+        "https://marine-api.open-meteo.com/v1/marine"
+        f"?latitude={SPOT_LAT}&longitude={SPOT_LON}"
+        "&hourly=wave_height,swell_wave_height,swell_wave_period"
+        "&daily=sunrise,sunset"
+        "&timezone=America%2FToronto"
+    )
+    payload = requests.get(url, timeout=20).json()
+    hourly = payload.get("hourly", {})
+    marine_by_hour: dict[str, MarinePoint] = {}
+    for ts, wh, sh, sp in zip(
+        hourly.get("time", []),
+        hourly.get("wave_height", []),
+        hourly.get("swell_wave_height", []),
+        hourly.get("swell_wave_period", []),
+        strict=False,
+    ):
+        dt = datetime.fromisoformat(ts).replace(tzinfo=TZ)
+        if now <= dt <= end:
+            key = dt.strftime("%Y-%m-%dT%H:00")
+            marine_by_hour[key] = MarinePoint(
+                ts=dt,
+                wave_m=float(wh) if wh is not None else None,
+                swell_m=float(sh) if sh is not None else None,
+                swell_period_s=float(sp) if sp is not None else None,
+            )
+
+    daily = payload.get("daily", {})
+    sun_by_day: dict[str, SunWindow] = {}
+    for day, sunrise, sunset in zip(
+        daily.get("time", []),
+        daily.get("sunrise", []),
+        daily.get("sunset", []),
+        strict=False,
+    ):
+        sunrise_dt = datetime.fromisoformat(sunrise).replace(tzinfo=TZ)
+        sunset_dt = datetime.fromisoformat(sunset).replace(tzinfo=TZ)
+        sun_by_day[str(day)] = SunWindow(day=str(day), sunrise=sunrise_dt, sunset=sunset_dt)
+
+    marine_non_null = sum(1 for m in marine_by_hour.values() if m.wave_m is not None)
+    notes.append(
+        f"Marine+soleil OK ({len(marine_by_hour)} h, {len(sun_by_day)} jours, vagues non-nulles: {marine_non_null})."
+    )
+    return marine_by_hour, sun_by_day, notes
+
+
+def parse_float(text: str) -> float | None:
+    m = re.search(r"-?\d+(?:\.\d+)?", text)
+    return float(m.group(0)) if m else None
+
+
+def parse_windy_hour(label: str) -> int | None:
+    m = re.search(r"(\d{1,2})\s*(AM|PM)", label, flags=re.I)
+    if not m:
+        return None
+    hour = int(m.group(1)) % 12
+    if m.group(2).upper() == "PM":
+        hour += 12
+    return hour
+
+
+def fetch_windy_waves(hours: int = 120) -> tuple[dict[str, MarinePoint], list[str]]:
+    notes: list[str] = []
+    try:
+        coord_match = re.search(r"windy\.com/(-?\d+(?:\.\d+)?)/(-?\d+(?:\.\d+)?)", WINDY_WAVES_URL)
+        lat = float(coord_match.group(1)) if coord_match else SPOT_LAT
+        lon = float(coord_match.group(2)) if coord_match else SPOT_LON
+        manifest_url = "https://node.windy.com/metadata/v1.0/forecast/ecmwf-wam/minifest.json?pr=1&sc=0&v=50.0.3"
+        manifest = requests.get(manifest_url, timeout=20, headers={"User-Agent": "Mozilla/5.0"}).json()
+        ref_time = manifest["ref"]
+
+        raw_path = f"point/ecmwfWaves/v2.9/{lat:.3f}/{lon:.3f}?refTime={ref_time}&source=detail&step=3"
+        encoded_parts = [
+            base64.urlsafe_b64encode(part.encode()).decode().rstrip("=")
+            for part in ("forecast", "ecmwfWaves", raw_path)
+        ]
+        url = "https://node.windy.com/" + "/".join(encoded_parts)
+        out: dict[str, MarinePoint] = {}
+        for attempt in range(2):
+            encoded = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"}).text
+            padded = encoded + "=" * ((4 - len(encoded) % 4) % 4)
+            payload = json.loads(base64.b64decode(padded))
+            data = payload.get("data", {})
+
+            ts_arr = data.get("ts", [])
+            wave_arr = data.get("waves", [])
+            swell_arr = data.get("swell", data.get("swell1", []))
+            period_arr = data.get("swellPeriod", data.get("swell1Period", []))
+            out = {}
+            now = datetime.now(tz=TZ)
+            for ts_ms, wave, swell, period in zip(ts_arr, wave_arr, swell_arr, period_arr, strict=False):
+                ts = datetime.fromtimestamp(int(ts_ms) / 1000, tz=TZ)
+                if ts < now - timedelta(hours=6) or ts > now + timedelta(hours=hours):
+                    continue
+                key = ts.strftime("%Y-%m-%dT%H:00")
+                out[key] = MarinePoint(
+                    ts=ts,
+                    wave_m=float(wave) if wave is not None else None,
+                    swell_m=float(swell) if swell is not None else None,
+                    swell_period_s=float(period) if period is not None else None,
+                )
+            if any(m.wave_m is not None for m in out.values()) or attempt == 1:
+                break
+
+        non_null = sum(1 for m in out.values() if m.wave_m is not None)
+        sample = next(iter(out.values()), None)
+        sample_txt = f", sample={sample.wave_m}/{sample.swell_m}/{sample.swell_period_s}" if sample else ""
+        notes.append(f"Windy waves API OK ({len(out)} points 3h, vagues non-nulles: {non_null}{sample_txt}).")
+        return out, notes
+    except Exception as exc:
+        return {}, [f"Windy waves indisponible ({exc})."]
+
+
+def merge_wave_sources(
+    primary: dict[str, MarinePoint],
+    fallback: dict[str, MarinePoint],
+) -> dict[str, MarinePoint]:
+    merged = dict(primary)
+    for key, point in fallback.items():
+        current = merged.get(key)
+        if current is None or current.wave_m is None:
+            merged[key] = point
+    return merged
+
+
+def nearest_marine_point(ts: datetime, marine_by_hour: dict[str, MarinePoint], max_delta_hours: float = 2.0) -> MarinePoint | None:
+    if not marine_by_hour:
+        return None
+    points = [m for m in marine_by_hour.values() if m.wave_m is not None]
+    if not points:
+        points = list(marine_by_hour.values())
+    nearest = min(points, key=lambda m: abs((m.ts - ts).total_seconds()))
+    delta_h = abs((nearest.ts - ts).total_seconds()) / 3600.0
+    return nearest if delta_h <= max_delta_hours else None
+
+
+def debug_data_alignment(
+    forecast: list[ForecastHour],
+    marine_by_hour: dict[str, MarinePoint],
+) -> str:
+    wind_keys = {p.ts.strftime("%Y-%m-%dT%H:00") for p in forecast}
+    marine_keys = set(marine_by_hour.keys())
+    overlap = wind_keys & marine_keys
+    marine_non_null = sum(1 for m in marine_by_hour.values() if m.wave_m is not None)
+    return (
+        f"DEBUG alignment | wind_hours={len(wind_keys)} marine_hours={len(marine_keys)} "
+        f"overlap={len(overlap)} marine_wave_non_null={marine_non_null}"
+    )
+
+
 def fetch_windguru_or_fallback(hours: int = 48) -> tuple[list[ForecastHour], list[str]]:
     """Essaye Windguru API (session + referer), sinon fallback Open-Meteo."""
     notes: list[str] = []
@@ -126,8 +346,8 @@ def fetch_windguru_or_fallback(hours: int = 48) -> tuple[list[ForecastHour], lis
             "Referer": "https://www.windguru.cz/148269",
             "X-Requested-With": "XMLHttpRequest",
         }
-        session.get("https://www.windguru.cz/148269", headers=headers, timeout=20)
-        meta_url = "https://www.windguru.cz/int/iapi.php?q=forecast_spot&id_spot=148269"
+        session.get(f"https://www.windguru.cz/{WINDGURU_SPOT_ID}", headers=headers, timeout=20)
+        meta_url = f"https://www.windguru.cz/int/iapi.php?q=forecast_spot&id_spot={WINDGURU_SPOT_ID}"
         meta = session.get(meta_url, headers=headers, timeout=20).json()
         tabs = meta.get("tabs", [])
         model_info = None
@@ -144,7 +364,7 @@ def fetch_windguru_or_fallback(hours: int = 48) -> tuple[list[ForecastHour], lis
             "https://www.windguru.net/int/iapi.php?q=forecast"
             f"&id_model={model_info['id_model']}"
             f"&rundef={model_info['rundef']}"
-            "&id_spot=148269"
+            f"&id_spot={WINDGURU_SPOT_ID}"
             "&WGCACHEABLE=21600"
             f"&cachefix={model_info['cachefix']}"
         )
@@ -188,9 +408,9 @@ def fetch_tempest_observed_estimate() -> tuple[float | None, float | None, float
         url = (
             "https://swd.weatherflow.com/swd/rest/observations/location"
             "?callback=cb"
-            "&api_key=6bff2f89-84ab-463c-886e-fc0f443da4cf"
+            f"&api_key={TEMPEST_API_KEY}"
             "&build=173"
-            "&location_id=73230"
+            f"&location_id={TEMPEST_LOCATION_ID}"
             f"&_={int(datetime.now(tz=TZ).timestamp() * 1000)}"
         )
         text = requests.get(
@@ -220,7 +440,7 @@ def fetch_tempest_observed_estimate() -> tuple[float | None, float | None, float
 
 def fetch_tides_gc(days: int = 2) -> tuple[list[TideEvent], list[str]]:
     notes: list[str] = []
-    html = http_get_text("https://www.marees.gc.ca/fr/stations/2985")
+    html = http_get_text(f"https://www.marees.gc.ca/fr/stations/{TIDE_STATION_ID}")
     text = unescape(re.sub(r"<[^>]+>", " ", html))
     lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines()]
     lines = [ln for ln in lines if ln]
@@ -387,19 +607,32 @@ def confidence_label(quality: float) -> str:
     return "Basse"
 
 
-def choose_best_windows(forecast: list[ForecastHour], tides: list[TideEvent]) -> list[dict[str, Any]]:
-    return choose_best_windows_horizon(forecast, tides, horizon_hours=24, top_n=3)
+def is_daylight(ts: datetime, sun_by_day: dict[str, SunWindow]) -> bool:
+    day_key = ts.strftime("%Y-%m-%d")
+    sun = sun_by_day.get(day_key)
+    if sun is None:
+        return True
+    return sun.sunrise <= ts <= sun.sunset
+
+
+def choose_best_windows(
+    forecast: list[ForecastHour],
+    tides: list[TideEvent],
+    sun_by_day: dict[str, SunWindow],
+) -> list[dict[str, Any]]:
+    return choose_best_windows_horizon(forecast, tides, sun_by_day, horizon_hours=24, top_n=3)
 
 
 def choose_best_windows_horizon(
     forecast: list[ForecastHour],
     tides: list[TideEvent],
+    sun_by_day: dict[str, SunWindow],
     horizon_hours: int,
     top_n: int,
 ) -> list[dict[str, Any]]:
     now = datetime.now(tz=TZ).replace(minute=0, second=0, microsecond=0)
     end = now + timedelta(hours=horizon_hours)
-    in_scope = [p for p in forecast if now <= p.ts <= end]
+    in_scope = [p for p in forecast if now <= p.ts <= end and is_daylight(p.ts, sun_by_day)]
 
     out: list[dict[str, Any]] = []
     for p in in_scope:
@@ -441,7 +674,7 @@ def print_report(
     conf = confidence_label(quality)
 
     print("=" * 72)
-    print("AI Agent Kite Report - Rimouski (FR)".center(72))
+    print(f"AI Agent Kite Report - {SPOT_NAME} (FR)".center(72))
     print(now.strftime("Généré le %Y-%m-%d à %H:%M (%Z)").center(72))
     print("=" * 72)
     if has_obs:
@@ -561,18 +794,25 @@ def post_discord(webhook_url: str, content: str) -> None:
 def build_discord_alert_markdown(
     top: list[dict[str, Any]],
     tides: list[TideEvent],
+    marine_by_hour: dict[str, MarinePoint],
+    sun_by_day: dict[str, SunWindow],
     tempest_avg: float | None,
     tempest_gust: float | None,
     tempest_dir: float | None,
+    surf_only_hint: str | None,
 ) -> str:
     now = datetime.now(tz=TZ)
     lines: list[str] = []
-    lines.append("## AI Agent Kite Report - Rimouski")
+    lines.append(f"## AI Kite Opportunity - {SPOT_NAME}")
+    lines.append("")
     lines.append(f"🕒 *{now.strftime('%a %Y-%m-%d %H:%M %Z')}*")
 
     if tempest_avg is not None:
         dir_txt = cardinal_16(tempest_dir) or "?"
-        gust_txt = f"{tempest_gust:.1f}" if tempest_gust is not None else "n/a"
+        gust_val = tempest_gust if tempest_gust is not None else None
+        if gust_val is not None:
+            gust_val = max(gust_val, tempest_avg)
+        gust_txt = f"{gust_val:.1f}" if gust_val is not None else "n/a"
         lines.append(f"🌬️ **Live Tempest**: {tempest_avg:.1f} kt (rafale {gust_txt} kt) • {dir_txt}")
     else:
         lines.append("🌬️ **Live Tempest**: indisponible")
@@ -581,6 +821,13 @@ def build_discord_alert_markdown(
     high = next((t for t in tides if t.kind == "high" and t.ts >= now), None)
     if high is not None:
         lines.append(f"🌊 **Prochaine marée haute**: {high.ts.strftime('%a %H:%M')} ({high.level_m:.2f} m)")
+    today = sun_by_day.get(now.strftime("%Y-%m-%d"))
+    if today is not None:
+        lines.append(f"🌄 **Lever/Coucher**: {today.sunrise.strftime('%H:%M')} - {today.sunset.strftime('%H:%M')}")
+
+    if surf_only_hint:
+        lines.append("")
+        lines.append(surf_only_hint)
 
     lines.append("")
     lines.append("### Top opportunités (24h)")
@@ -590,23 +837,35 @@ def build_discord_alert_markdown(
         p: ForecastHour = row["pt"]
         gear = {"foil": "🪁 Foil", "twintip": "🏄 Twin-tip", "surf": "🌊 Surf"}.get(row["discipline"], row["discipline"])
         dir_txt = cardinal_16(p.wind_deg) or "?"
-        gust_txt = f"{p.gust_kt:.1f}" if p.gust_kt is not None else "n/a"
+        gust_val = p.gust_kt if p.gust_kt is not None else None
+        if gust_val is not None:
+            gust_val = max(gust_val, p.wind_kt)
+        gust_txt = f"{gust_val:.1f}" if gust_val is not None else "n/a"
+        m = nearest_marine_point(p.ts, marine_by_hour)
+        wave_txt = " • 🌊 n/a"
+        if m is not None:
+            wave = f"{m.wave_m:.1f}m" if m.wave_m is not None else "n/a"
+            swell = f"{m.swell_m:.1f}m" if m.swell_m is not None else "n/a"
+            period = f"{m.swell_period_s:.0f}s" if m.swell_period_s is not None else "n/a"
+            wave_txt = f" • 🌊 {wave} | houle {swell} {period}"
         lines.append(
-            f"- **{p.ts.strftime('%a %H:%M')}** • **{row['score']:.0f}** • {gear} • {p.wind_kt:.1f}kt g{gust_txt} • {dir_txt}"
+            f"- **{p.ts.strftime('%a %H:%M')}** • {gear} • vent {p.wind_kt:.1f}/{gust_txt} kt • {dir_txt}{wave_txt}"
         )
 
-    lines.append("")
-    lines.append("_Règles Rimouski: Foil 8-16 kt (+/-2h marée haute), Twin-tip 17-35 kt, dirs SW/NE._")
     return "\n".join(lines)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="AI Agent Kite Report")
+    parser.add_argument("--config", type=str, default="config/rimouski.json", help="Chemin du fichier de config JSON")
     parser.add_argument("--monitor", action="store_true", help="N'affiche/envoie que si score >= seuil")
+    parser.add_argument("--debug-data", action="store_true", help="Affiche un diagnostic d'alignement des sources")
     parser.add_argument("--threshold", type=float, default=80.0, help="Seuil minimum de score pour alerte")
     parser.add_argument("--horizon-hours", type=int, default=72, help="Fenêtre de recherche d'opportunité")
     parser.add_argument("--discord-webhook", type=str, default="", help="Webhook Discord pour envoi")
     args = parser.parse_args()
+
+    load_config(args.config)
 
     notes: list[str] = []
     tides, tide_notes = fetch_tides_gc(days=2)
@@ -620,19 +879,51 @@ def main() -> int:
     obs_avg, obs_gust, obs_dir, tempest_notes = fetch_tempest_observed_estimate()
     notes.extend(tempest_notes)
 
-    top = choose_best_windows(forecast, tides)
+    windy_waves, windy_notes = fetch_windy_waves(hours=max(120, args.horizon_hours))
+    notes.extend(windy_notes)
+    marine_by_hour, sun_by_day, marine_notes = fetch_marine_and_sun(hours=max(72, args.horizon_hours))
+    notes.extend(marine_notes)
+    marine_by_hour = merge_wave_sources(marine_by_hour, windy_waves)
+
+    if args.debug_data:
+        print(debug_data_alignment(forecast, marine_by_hour))
+        for note in notes:
+            print(f"DEBUG source | {note}")
+
+    top = choose_best_windows(forecast, tides, sun_by_day)
 
     if args.monitor:
         candidates = choose_best_windows_horizon(
             forecast,
             tides,
+            sun_by_day,
             horizon_hours=max(1, args.horizon_hours),
             top_n=5,
         )
         qualified = [c for c in candidates if c["score"] >= args.threshold]
+        surf_only_hint = None
         if not qualified:
-            return 0
-        report = build_discord_alert_markdown(top, tides, obs_avg, obs_gust, obs_dir)
+            # surf-only trigger: high waves even if kite score is low
+            big_waves = [
+                m for m in marine_by_hour.values() if m.wave_m is not None and m.wave_m >= SURF_ONLY_WAVE_TRIGGER_M
+            ]
+            if not big_waves:
+                return 0
+            best_wave = max(big_waves, key=lambda x: x.wave_m or 0.0)
+            surf_only_hint = (
+                f"🏄 **Surf possible même sans kite fort**: vague ~{best_wave.wave_m:.1f} m "
+                f"vers {best_wave.ts.strftime('%a %H:%M')}"
+            )
+        report = build_discord_alert_markdown(
+            top,
+            tides,
+            marine_by_hour,
+            sun_by_day,
+            obs_avg,
+            obs_gust,
+            obs_dir,
+            surf_only_hint,
+        )
         if args.discord_webhook:
             post_discord(args.discord_webhook, report)
         else:
