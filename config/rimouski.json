@@ -24,5 +24,10 @@
     "surf_memory_h": 48,
     "surf_trigger_dirs": ["NE", "NW"],
     "surf_only_wave_trigger_m": 1.0
+  },
+  "alert": {
+    "threshold": 80,
+    "horizon_hours": 72,
+    "discord_webhook": ""
   }
 }

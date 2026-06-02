@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import statistics
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from html import unescape
@@ -39,6 +40,19 @@ SURF_STRONG_WIND_THRESHOLD = 25.0
 SURF_MEMORY_H = 48
 SURF_TRIGGER_DIRS = {"NE", "NW"}
 SURF_ONLY_WAVE_TRIGGER_M = 1.0
+ALERT_THRESHOLD = 80.0
+ALERT_HORIZON_HOURS = 72
+DISCORD_WEBHOOK_URL = ""
+
+
+def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
 
 
 def load_config(config_path: str) -> None:
@@ -47,11 +61,15 @@ def load_config(config_path: str) -> None:
     global PREFERRED_DIRECTIONS, FOIL_MIN, FOIL_MAX, TT_MIN, TT_MAX
     global GUST_IDEAL_MAX, GUST_ACCEPTABLE_MAX, FOIL_HIGH_TIDE_WINDOW_H
     global SURF_STRONG_WIND_THRESHOLD, SURF_MEMORY_H, SURF_TRIGGER_DIRS, SURF_ONLY_WAVE_TRIGGER_M
+    global ALERT_THRESHOLD, ALERT_HORIZON_HOURS, DISCORD_WEBHOOK_URL
 
     p = Path(config_path)
     if not p.exists():
         return
     cfg = json.loads(p.read_text())
+    local_path = p.with_name(f"{p.stem}.local{p.suffix}")
+    if local_path.exists():
+        cfg = deep_merge(cfg, json.loads(local_path.read_text()))
 
     tzname = cfg.get("timezone", "America/Toronto")
     TZ = ZoneInfo(tzname)
@@ -80,6 +98,11 @@ def load_config(config_path: str) -> None:
     SURF_MEMORY_H = int(prefs.get("surf_memory_h", SURF_MEMORY_H))
     SURF_TRIGGER_DIRS = set(prefs.get("surf_trigger_dirs", list(SURF_TRIGGER_DIRS)))
     SURF_ONLY_WAVE_TRIGGER_M = float(prefs.get("surf_only_wave_trigger_m", SURF_ONLY_WAVE_TRIGGER_M))
+
+    alert = cfg.get("alert", {})
+    ALERT_THRESHOLD = float(alert.get("threshold", ALERT_THRESHOLD))
+    ALERT_HORIZON_HOURS = int(alert.get("horizon_hours", ALERT_HORIZON_HOURS))
+    DISCORD_WEBHOOK_URL = str(alert.get("discord_webhook", DISCORD_WEBHOOK_URL))
 
 
 @dataclass
@@ -264,7 +287,7 @@ def fetch_windy_waves(hours: int = 120) -> tuple[dict[str, MarinePoint], list[st
         ]
         url = "https://node.windy.com/" + "/".join(encoded_parts)
         out: dict[str, MarinePoint] = {}
-        for attempt in range(2):
+        for attempt in range(6):
             encoded = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"}).text
             padded = encoded + "=" * ((4 - len(encoded) % 4) % 4)
             payload = json.loads(base64.b64decode(padded))
@@ -287,8 +310,9 @@ def fetch_windy_waves(hours: int = 120) -> tuple[dict[str, MarinePoint], list[st
                     swell_m=float(swell) if swell is not None else None,
                     swell_period_s=float(period) if period is not None else None,
                 )
-            if any(m.wave_m is not None for m in out.values()) or attempt == 1:
+            if any(m.wave_m is not None for m in out.values()) or attempt == 5:
                 break
+            time.sleep(0.5)
 
         non_null = sum(1 for m in out.values() if m.wave_m is not None)
         sample = next(iter(out.values()), None)
@@ -805,7 +829,8 @@ def build_discord_alert_markdown(
     lines: list[str] = []
     lines.append(f"## AI Kite Opportunity - {SPOT_NAME}")
     lines.append("")
-    lines.append(f"🕒 *{now.strftime('%a %Y-%m-%d %H:%M %Z')}*")
+    lines.append("")
+    lines.append(f"*{now.strftime('%a %Y-%m-%d %H:%M %Z')}*")
 
     if tempest_avg is not None:
         dir_txt = cardinal_16(tempest_dir) or "?"
@@ -813,14 +838,14 @@ def build_discord_alert_markdown(
         if gust_val is not None:
             gust_val = max(gust_val, tempest_avg)
         gust_txt = f"{gust_val:.1f}" if gust_val is not None else "n/a"
-        lines.append(f"🌬️ **Live Tempest**: {tempest_avg:.1f} kt (rafale {gust_txt} kt) • {dir_txt}")
+        lines.append(f"🌬️ **Tempest**: {tempest_avg:.1f} kt (rafale {gust_txt} kt) • {dir_txt}")
     else:
-        lines.append("🌬️ **Live Tempest**: indisponible")
+        lines.append("🌬️ **Tempest**: indisponible")
 
 
     high = next((t for t in tides if t.kind == "high" and t.ts >= now), None)
     if high is not None:
-        lines.append(f"🌊 **Prochaine marée haute**: {high.ts.strftime('%a %H:%M')} ({high.level_m:.2f} m)")
+        lines.append(f"🌊 **Marée haute**: {high.ts.strftime('%a %H:%M')} ({high.level_m:.2f} m)")
     today = sun_by_day.get(now.strftime("%Y-%m-%d"))
     if today is not None:
         lines.append(f"🌄 **Lever/Coucher**: {today.sunrise.strftime('%H:%M')} - {today.sunset.strftime('%H:%M')}")
@@ -831,6 +856,8 @@ def build_discord_alert_markdown(
 
     lines.append("")
     lines.append("### Top opportunités (24h)")
+    lines.append("")
+    lines.append("")
     if not top:
         lines.append("- Aucun créneau solide détecté")
     for row in top[:3]:
@@ -845,11 +872,10 @@ def build_discord_alert_markdown(
         wave_txt = " • 🌊 n/a"
         if m is not None:
             wave = f"{m.wave_m:.1f}m" if m.wave_m is not None else "n/a"
-            swell = f"{m.swell_m:.1f}m" if m.swell_m is not None else "n/a"
             period = f"{m.swell_period_s:.0f}s" if m.swell_period_s is not None else "n/a"
-            wave_txt = f" • 🌊 {wave} | houle {swell} {period}"
+            wave_txt = f" • 🌊 {wave} | {period}"
         lines.append(
-            f"- **{p.ts.strftime('%a %H:%M')}** • {gear} • vent {p.wind_kt:.1f}/{gust_txt} kt • {dir_txt}{wave_txt}"
+            f"- **{p.ts.strftime('%a %H:%M')}** • {gear} • {p.wind_kt:.1f}/{gust_txt} kt • {dir_txt}{wave_txt}"
         )
 
     return "\n".join(lines)
@@ -860,18 +886,21 @@ def main() -> int:
     parser.add_argument("--config", type=str, default="config/rimouski.json", help="Chemin du fichier de config JSON")
     parser.add_argument("--monitor", action="store_true", help="N'affiche/envoie que si score >= seuil")
     parser.add_argument("--debug-data", action="store_true", help="Affiche un diagnostic d'alignement des sources")
-    parser.add_argument("--threshold", type=float, default=80.0, help="Seuil minimum de score pour alerte")
-    parser.add_argument("--horizon-hours", type=int, default=72, help="Fenêtre de recherche d'opportunité")
-    parser.add_argument("--discord-webhook", type=str, default="", help="Webhook Discord pour envoi")
+    parser.add_argument("--threshold", type=float, default=None, help="Remplace le seuil minimum de score")
+    parser.add_argument("--horizon-hours", type=int, default=None, help="Remplace la fenêtre de recherche")
+    parser.add_argument("--discord-webhook", type=str, default=None, help="Remplace le webhook Discord")
     args = parser.parse_args()
 
     load_config(args.config)
+    threshold = ALERT_THRESHOLD if args.threshold is None else args.threshold
+    horizon_hours = ALERT_HORIZON_HOURS if args.horizon_hours is None else args.horizon_hours
+    discord_webhook = DISCORD_WEBHOOK_URL if args.discord_webhook is None else args.discord_webhook
 
     notes: list[str] = []
     tides, tide_notes = fetch_tides_gc(days=2)
     notes.extend(tide_notes)
 
-    fetch_horizon = max(48, args.horizon_hours)
+    fetch_horizon = max(48, horizon_hours)
     forecast, wind_notes = fetch_windguru_or_fallback(hours=fetch_horizon)
     notes.extend(wind_notes)
     notes.append(f"Prevision source: {forecast[0].source if forecast else 'aucune'} ({len(forecast)} points)")
@@ -879,9 +908,9 @@ def main() -> int:
     obs_avg, obs_gust, obs_dir, tempest_notes = fetch_tempest_observed_estimate()
     notes.extend(tempest_notes)
 
-    windy_waves, windy_notes = fetch_windy_waves(hours=max(120, args.horizon_hours))
+    windy_waves, windy_notes = fetch_windy_waves(hours=max(120, horizon_hours))
     notes.extend(windy_notes)
-    marine_by_hour, sun_by_day, marine_notes = fetch_marine_and_sun(hours=max(72, args.horizon_hours))
+    marine_by_hour, sun_by_day, marine_notes = fetch_marine_and_sun(hours=max(72, horizon_hours))
     notes.extend(marine_notes)
     marine_by_hour = merge_wave_sources(marine_by_hour, windy_waves)
 
@@ -897,10 +926,10 @@ def main() -> int:
             forecast,
             tides,
             sun_by_day,
-            horizon_hours=max(1, args.horizon_hours),
+            horizon_hours=max(1, horizon_hours),
             top_n=5,
         )
-        qualified = [c for c in candidates if c["score"] >= args.threshold]
+        qualified = [c for c in candidates if c["score"] >= threshold]
         surf_only_hint = None
         if not qualified:
             # surf-only trigger: high waves even if kite score is low
@@ -924,8 +953,8 @@ def main() -> int:
             obs_dir,
             surf_only_hint,
         )
-        if args.discord_webhook:
-            post_discord(args.discord_webhook, report)
+        if discord_webhook:
+            post_discord(discord_webhook, report)
         else:
             print(report)
         return 0
